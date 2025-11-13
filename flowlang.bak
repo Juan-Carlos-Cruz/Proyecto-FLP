@@ -1,0 +1,290 @@
+#lang racket
+;; FlowLang – Intérprete combinado (v2 corregido)
+;;  - var/const, asignación y secuenciación (store de referencias)
+;;  - funciones/closures (lexical), recursión
+;;  - paso de parámetros: por valor (escalares) y por referencia (listas, diccionarios, objetos)
+;;  - listas, diccionarios, objetos prototipales (clone, lookup por proto)
+;;  - if, while, for, switch
+;;  - primitivas aritméticas y lógicas: + - * / < <= > >= equal? and or not
+;;  - pruebas incluidas al final
+
+(struct binding (loc mutable?) #:transparent)
+(struct closure (params body env) #:transparent)
+(struct obj (fields proto) #:transparent)   ; fields: (hash), proto: obj|#f
+
+(define (make-empty-store) (values (make-hasheq) 0))
+(define (store-alloc store next v) (define loc next) (hash-set! store loc v) (values loc (add1 next)))
+(define (store-ref store loc) (hash-ref store loc (λ () (error 'store-ref "loc no asignada: ~a" loc))))
+(define (store-set! store loc v) (hash-set! store loc v))
+(define empty-env (hash))
+(define (env-lookup env name) (hash-ref env name (λ () (error 'lookup "variable no definida: ~a" name))))
+(define (env-extend env name bind) (hash-set env name bind))
+
+(define (scalar? v) (or (number? v) (boolean? v) (string? v) (eq? v 'null)))
+(define (listV? v) (and (pair? v) (not (obj? v))))
+(define (dictV? v) (hash? v))
+(define (objV? v) (obj? v))
+(define (compound? v) (or (listV? v) (dictV? v) (objV? v)))
+(define (truthy? v) (not (eq? v #f)))
+(define (type-of* v)
+  (cond [(number? v) 'number]
+        [(boolean? v) 'bool]
+        [(string? v) 'string]
+        [(eq? v 'null) 'null]
+        [(closure? v) 'function]
+        [(obj? v) 'object]
+        [(hash? v) 'dict]
+        [(pair? v) 'list]
+        [else 'unknown]))
+
+(define (result v env store next) (values v env store next))
+(define (eval-program ast) (define-values (S N) (make-empty-store)) (define-values (v _e _S _N) (eval* ast empty-env S N)) v)
+
+(define (eval* ast env store next)
+  (match ast
+    [(list 'program es ...) (eval-seq es env store next #t)]
+    [(list 'block es ...)   (eval-seq es env store next #f)]
+    [(list 'begin es ...)   (eval-seq-flat es env store next)]
+
+    [(list 'var (app symbol? x) e)
+     (define-values (v1 env1 s1 n1) (eval* e env store next))
+     (define-values (loc n2) (store-alloc s1 n1 v1))
+     (result 'ok (env-extend env1 x (binding loc #t)) s1 n2)]
+
+    [(list 'const (app symbol? x) e)
+     (define-values (v1 env1 s1 n1) (eval* e env store next))
+     (define-values (loc n2) (store-alloc s1 n1 v1))
+     (result 'ok (env-extend env1 x (binding loc #f)) s1 n2)]
+
+    [(list 'set (app symbol? x) e)
+     (define b (env-lookup env x))
+     (unless (binding-mutable? b) (error 'set "no se puede asignar a const ~a" x))
+     (define-values (v1 env1 s1 n1) (eval* e env store next))
+     (store-set! s1 (binding-loc b) v1)
+     (result v1 env1 s1 n1)]
+
+    [(? symbol? x)
+     (define b (env-lookup env x))
+     (result (store-ref store (binding-loc b)) env store next)]
+
+    [(list 'if c t e)
+     (define-values (vc e1 s1 n1) (eval* c env store next))
+     (if (truthy? vc) (eval* t e1 s1 n1) (eval* e e1 s1 n1))]
+
+    [(list 'while c body)
+     (let loop ((e0 env) (s0 store) (n0 next) (last 'null))
+       (define-values (vc e1 s1 n1) (eval* c e0 s0 n0))
+       (if (truthy? vc)
+           (begin (define-values (vb e2 s2 n2) (eval* body e1 s1 n1)) (loop e2 s2 n2 vb))
+           (values last e1 s1 n1)))]
+
+    [(list 'for (list init c step) body)
+     (define-values (_vi e1 s1 n1) (eval* init env store next))
+     (let loop ((e0 e1) (s0 s1) (n0 n1) (last 'null))
+       (define-values (vc e2 s2 n2) (eval* c e0 s0 n0))
+       (if (truthy? vc)
+           (begin (define-values (vb e3 s3 n3) (eval* body e2 s2 n2))
+                  (define-values (_vs e4 s4 n4) (eval* step e3 s3 n3))
+                  (loop e4 s4 n4 vb))
+           (values last e2 s2 n2)))]
+
+    [(list 'switch e cases ...)
+     (define-values (v e1 s1 n1) (eval* e env store next))
+     (define default-branch (for/or ([c cases]) (and (pair? c) (eq? (car c) 'default) c)))
+     (define (run b) (eval* b e1 s1 n1))
+     (let try ((cs cases))
+       (cond [(null? cs) (if default-branch (run (cadr default-branch)) (values 'null e1 s1 n1))]
+             [else (define c (car cs))
+                   (match c
+                     [(list 'case vcase body)
+                      (if (equal? v (raw-value vcase)) (run body) (try (cdr cs)))]
+                     [(list 'default body) (try (cdr cs))]
+                     [else (error 'switch (format "caso mal formado: ~a" c))])]))]
+
+    [(list 'fun (list params ...) body) (result (closure params body env) env store next)]
+
+    [(list 'call f . args)
+     (define-values (vf e1 s1 n1) (eval* f env store next))
+     (cond
+       [(closure? vf)
+        (define c vf)
+        (define argvals '()) (define arglocs '())
+        (let loopA ((as args) (e e1) (s s1) (n n1) (av '()) (al '()))
+          (if (null? as)
+              (begin (set! argvals (reverse av)) (set! arglocs (reverse al)) (values 'ok e s n))
+              (begin
+                (define a (car as))
+                (define-values (v e2 s2 n2) (eval* a e s n))
+                (define maybe-loc (cond [(symbol? a) (binding-loc (env-lookup e a))]
+                                        [(compound? v) (let-values ([(loc n3) (store-alloc s2 n2 v)]) (set! s2 s2) (set! n2 n3) loc)]
+                                        [else #f]))
+                (loopA (cdr as) e2 s2 n2 (cons v av) (cons maybe-loc al)))))
+        (define env-call
+          (foldl (λ (p acc)
+                   (define x (car p)) (define idx (cdr p))
+                   (define v (list-ref argvals idx))
+                   (define mloc (list-ref arglocs idx))
+                   (define-values (loc _n2)
+                     (if (and mloc (compound? v)) (values mloc n1) (store-alloc s1 n1 v)))
+                   (env-extend acc x (binding loc #t)))
+                 (closure-env c)
+                 (for/list ([x (closure-params c)] [i (in-naturals)]) (cons x i))))
+        (eval* (closure-body c) env-call s1 n1)]
+       [else (eval-prim-call vf args e1 s1 n1)])]
+
+    [(list 'list es ...) (define-values (vals e1 s1 n1) (eval-list es env store next)) (result vals e1 s1 n1)]
+
+    [(list 'dict . pairs)
+     (define h (make-hasheq))
+     (define (add-pair p e s n)
+       (match p
+         [(list (app symbol? k) e1) (define-values (v e2 s2 n2) (eval* e1 e s n)) (hash-set! h k v) (values 'ok e2 s2 n2)]
+         [else (error 'dict (format "par mal formado: ~a" p))]))
+     (define-values (_ e1 s1 n1) (foldl (λ (p acc) (call-with-values (λ () acc) (λ (_ e s n) (add-pair p e s n)))) (values 'ok env store next) pairs))
+     (result h e1 s1 n1)]
+
+    [(list 'dict-get d (app symbol? k)) (define-values (vd e1 s1 n1) (eval* d env store next)) (unless (dictV? vd) (error 'dict-get "no es diccionario")) (result (hash-ref vd k 'null) e1 s1 n1)]
+    [(list 'dict-set! d (app symbol? k) e)
+     (define-values (vd e1 s1 n1) (eval* d env store next)) (unless (dictV? vd) (error 'dict-set! "no es diccionario"))
+     (define-values (vv e2 s2 n2) (eval* e e1 s1 n1)) (hash-set! vd k vv) (result vv e2 s2 n2)]
+
+    [(list 'obj . specs)
+     (define h (make-hasheq)) (define proto #f)
+     (define (handle-spec sp e s n)
+       (match sp
+         [(list 'proto e1) (define-values (vo e2 s2 n2) (eval* e1 e s n)) (unless (objV? vo) (error 'obj "proto debe ser objeto")) (set! proto vo) (values 'ok e2 s2 n2)]
+         [(list (app symbol? k) e1) (define-values (v e2 s2 n2) (eval* e1 e s n)) (hash-set! h k v) (values 'ok e2 s2 n2)]
+         [else (error 'obj (format "spec mal formada: ~a" sp))]))
+     (define-values (_ e1 s1 n1) (foldl (λ (sp acc) (call-with-values (λ () acc) (λ (_ e s n) (handle-spec sp e s n)))) (values 'ok env store next) specs))
+     (result (obj h proto) e1 s1 n1)]
+
+    [(list 'get o (app symbol? k)) (define-values (vo e1 s1 n1) (eval* o env store next)) (result (obj-get vo k) e1 s1 n1)]
+    [(list 'set-field! o (app symbol? k) e) (define-values (vo e1 s1 n1) (eval* o env store next)) (unless (objV? vo) (error 'set-field! "no es objeto")) (define-values (vv e2 s2 n2) (eval* e e1 s1 n1)) (hash-set! (obj-fields vo) k vv) (result vv e2 s2 n2)]
+    [(list 'clone o) (define-values (vo e1 s1 n1) (eval* o env store next)) (unless (objV? vo) (error 'clone "no es objeto")) (result (obj (make-hasheq) vo) e1 s1 n1)]
+
+    [(list 'type-of e) (define-values (v1 e1 s1 n1) (eval* e env store next)) (result (type-of* v1) e1 s1 n1)]
+    [(list 'len e) (define-values (v1 e1 s1 n1) (eval* e env store next)) (cond [(listV? v1) (result (length v1) e1 s1 n1)] [(dictV? v1) (result (hash-count v1) e1 s1 n1)] [(objV? v1) (result (hash-count (obj-fields v1)) e1 s1 n1)] [else (error 'len "tipo no soportado")])]
+    [(list 'keys d) (define-values (vd e1 s1 n1) (eval* d env store next)) (unless (dictV? vd) (error 'keys "no es diccionario")) (result (hash-keys vd) e1 s1 n1)]
+    [(list 'values d) (define-values (vd e1 s1 n1) (eval* d env store next)) (unless (dictV? vd) (error 'values "no es diccionario")) (result (hash-values vd) e1 s1 n1)]
+
+    [(list 'print es ...) (define-values (vals e1 s1 n1) (eval-list es env store next)) (for ([v vals]) (displayln v)) (result (if (null? vals) 'null (last vals)) e1 s1 n1)]
+    [(or (? number?) (? boolean?) (? string?) 'null) (result ast env store next)]
+    [else (error 'eval (format "AST no reconocido: ~a" ast))]))
+
+(define (eval-list es env store next)
+  (let loop ((es es) (e env) (s store) (n next) (acc '()))
+    (if (null? es) (values (reverse acc) e s n)
+        (begin (define-values (v e1 s1 n1) (eval* (car es) e s n)) (loop (cdr es) e1 s1 n1 (cons v acc))))))
+
+(define (eval-seq es env store next new-scope?)
+  (let seq ((es es) (e env) (s store) (n next) (last 'null))
+    (if (null? es) (values last e s n)
+        (begin (define-values (v1 e1 s1 n1) (eval* (car es) e s n)) (seq (cdr es) e1 s1 n1 v1)))))
+
+(define (eval-seq-flat es env store next)
+  (let seq ((es es) (e env) (s store) (n next) (last 'null))
+    (if (null? es) (values last e s n)
+        (begin (define-values (v1 e1 s1 n1) (eval* (car es) e s n)) (seq (cdr es) e1 s1 n1 v1)))))
+
+;; Primitivas (aritméticas/lógicas y utilitarias)
+(define (eval-prim-call f args env store next)
+  (define (eval1 e env store next) (eval* e env store next))
+  (define (eval2 a b env store next op)
+    (define-values (va e1 s1 n1) (eval1 a env store next))
+    (define-values (vb e2 s2 n2) (eval1 b e1 s1 n1))
+    (values (op va vb) e2 s2 n2))
+  (match f
+    ['+  (match args [(list a b) (eval2 a b env store next +)] [else (error '+ "uso: (call + a b)")])]
+    ['-  (match args [(list a b) (eval2 a b env store next -)] [else (error '- "uso: (call - a b)")])]
+    ['*  (match args [(list a b) (eval2 a b env store next *)] [else (error '* "uso: (call * a b)")])]
+    ['/  (match args [(list a b) (eval2 a b env store next /)] [else (error '/ "uso: (call / a b)")])]
+    ['<  (match args [(list a b) (eval2 a b env store next <)] [else (error '< "uso: (call < a b)")])]
+    ['<= (match args [(list a b) (eval2 a b env store next <=)] [else (error '<= "uso: (call <= a b)")])]
+    ['>  (match args [(list a b) (eval2 a b env store next >)] [else (error '> "uso: (call > a b)")])]
+    ['>= (match args [(list a b) (eval2 a b env store next >=)] [else (error '>= "uso: (call >= a b)")])]
+    ['not (match args [(list a) (define-values (va e1 s1 n1) (eval1 a env store next)) (values (not (truthy? va)) e1 s1 n1)] [else (error 'not "uso: (call not a)")])]
+    ['and (match args [(list a b) (define-values (va e1 s1 n1) (eval1 a env store next)) (if (truthy? va) (eval1 b e1 s1 n1) (values #f e1 s1 n1))] [else (error 'and "uso: (call and a b)")])]
+    ['or  (match args [(list a b) (define-values (va e1 s1 n1) (eval1 a env store next)) (if (truthy? va) (values va e1 s1 n1) (eval1 b e1 s1 n1))] [else (error 'or "uso: (call or a b)")])]
+    ['equal? (match args [(list a b) (define-values (va e1 s1 n1) (eval1 a env store next)) (define-values (vb e2 s2 n2) (eval1 b e1 s1 n1)) (values (equal? va vb) e2 s2 n2)] [else (error 'equal? "uso: (call equal? a b)")])]
+    ['list-push!
+     (match args
+       [(list L e)
+        (define-values (vL e1 s1 n1) (eval1 L env store next))
+        (define-values (vE e2 s2 n2) (eval1 e e1 s1 n1))
+        (unless (listV? vL) (error 'list-push! "L no es lista"))
+        (define newL (append vL (list vE)))
+        (when (symbol? L) (define b (env-lookup e2 L)) (store-set! s2 (binding-loc b) newL))
+        (values newL e2 s2 n2)]
+       [else (error 'list-push! "uso: (call list-push! lista expr)")])]
+    [else (error 'call (format "función/primitiva desconocida: ~a" f))]))
+
+(define (obj-get o k)
+  (unless (objV? o) (error 'get "no es objeto"))
+  (define fields (obj-fields o))
+  (cond [(hash-has-key? fields k) (hash-ref fields k)]
+        [(obj-proto o) => (λ (p) (obj-get p k))]
+        [else 'null]))
+
+(define (raw-value x)
+  (match x [(? symbol?) x] [(? number?) x] [(? string?) x] [(? boolean?) x] ['null 'null] [else x]))
+
+(module+ test
+  (define (run ast) (eval-program ast))
+
+  (displayln "== Prueba 1: var/const y set ==")
+  (run '(program (block (var x 10) (const y 20) (set x 15) (print x) (begin (print (type-of x)) (print (type-of y))) 999)))
+
+  (displayln "== Prueba 2: if/while/for ==")
+  (run '(program (block
+                   (var s 0)
+                   (for ((var i 0) (call < i 5) (set i (call + i 1)))
+                        (begin (set s (call + s i))))
+                   (print s) ; 10
+                   (var c 0)
+                   (while (call < c 3) (begin (set c (call + c 1))))
+                   (print c) ; 3
+                   999)))
+
+  (displayln "== Prueba 3: listas y paso por referencia ==")
+  (run '(program (block
+                   (var L (list 1 2))
+                   (call list-push! L 99)
+                   (print L) ; => (1 2 99)
+                   (var x 5)
+                   (var inc (fun (y) (set y (call + y 1))))
+                   (call inc x)
+                   (print x) ; 5 (escalares por valor)
+                   999)))
+
+  (displayln "== Prueba 4: diccionarios ==")
+  (run '(program (block
+                   (var D (dict (a 1) (b 2)))
+                   (print (dict-get D a)) ; 1
+                   (dict-set! D b 42)
+                   (print (dict-get D b)) ; 42
+                   (print (keys D))
+                   999)))
+
+  (displayln "== Prueba 5: funciones/closures y recursión ==")
+  (run '(program (block
+                   (var fact (fun (n) (if (call equal? n 0) 1 (call * n (call fact (call - n 1))))))
+                   (print (call fact 5)) ; 120
+                   999)))
+
+  (displayln "== Prueba 6: objetos prototipales y clone ==")
+  (run '(program (block
+                   (var base (obj (x 1) (y 2)))
+                   (var o1 (clone base))
+                   (set-field! o1 x 10)
+                   (print (get o1 x)) ; 10 (propia)
+                   (print (get o1 y)) ; 2  (heredada)
+                   (var o2 (obj (z 7) (proto o1)))
+                   (print (get o2 y)) ; 2 por la cadena
+                   999)))
+
+  (displayln "== Prueba 7: switch ==")
+  (run '(program (block
+                   (var k 2)
+                   (switch k (case 1 (print "uno")) (case 2 (print "dos")) (default (print "otro")))
+                   999)))
+)
